@@ -909,10 +909,64 @@ def user_risk_analysis(user_id):
         Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
     
-    score = 0
+    postScore = 0
+    commentScore = 0
+    user_risk_score = 0
+    account_age = 0
 
-    return score;
+    # Fetch result from database
+    result = query_db('SELECT created_at FROM users WHERE id = ?', (user_id,))
 
+    if result and result[0][0]:
+        account_created = result[0][0]
+        now = datetime.now()
+        delta = now - account_created
+        account_age = delta.days
+    else:
+        print("User not found or created_at is null")
+
+    user_posts = query_db('SELECT content FROM posts WHERE user_id = ?', (user_id,))
+    for post in user_posts:
+        _, post_risk_score = moderate_content(post['content'])
+        if(account_age < 7):
+            postScore += post_risk_score * 1.5
+        else:
+            postScore += post_risk_score
+            
+    if(len(user_posts) == 0):
+        average_post_score = 0
+    else:
+        average_post_score = postScore / len(user_posts)
+
+    user_comments = query_db('SELECT content FROM comments WHERE user_id = ?', (user_id,))
+    for comment in user_comments:
+        _, comment_risk_score = moderate_content(comment['content'])
+        if(account_age < 7):
+            commentScore += comment_risk_score * 1.5
+        else:
+            commentScore += comment_risk_score
+
+    if(len(user_comments) == 0):
+        average_comment_score = 0
+    else:
+        average_comment_score = commentScore / len(user_comments)
+
+    profiletext = query_db('SELECT profile FROM users WHERE id = ?', (user_id,))
+    if profiletext and profiletext[0][0]:
+        _, profile_score = moderate_content(profiletext[0][0])
+    else:
+        profile_score = 0
+
+    content_risk_score = (profile_score * 1) + (average_post_score * 3) + (average_comment_score * 1)
+
+    if(account_age < 7):
+        user_risk_score = content_risk_score * 1.5
+    elif(account_age < 30):
+        user_risk_score = content_risk_score * 1.2
+    else:
+        user_risk_score = content_risk_score
+    
+    return user_risk_score;
     
 # Task 3.3
 def moderate_content(content):
@@ -932,12 +986,57 @@ def moderate_content(content):
     Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
 
-    moderated_content = content
+    original_content = content
     score = 0
     
+    TIER1_PATTERN = r'\b(' + '|'.join(TIER1_WORDS) + r')\b'
+    TIER2_PATTERN = r'\b(' + '|'.join(TIER2_PHRASES) + r')\b'
+    TIER3_PATTERN = r'\b(' + '|'.join(TIER3_WORDS) + r')\b'
+
+    # found here https://www.freecodecamp.org/news/how-to-write-a-regular-expression-for-a-url/, but extended it by adding also possibility for [.] and \b
+    URL_PATTERN = r'\b((?:https:\/\/www\.|http:\/\/www\.|https:\/\/|http:\/\/)?[a-zA-Z0-9]{2,}((?:\.|\[\.\])[a-zA-Z0-9]{2,})((?:\.|\[\.\])[a-zA-Z0-9]{2,})?)\b'
+
+    # found here https://stackoverflow.com/questions/16699007/regular-expression-to-match-standard-10-digit-phone-number
+    PHONE_PATTERN = r'(\+\d{1,2}\s?)?1?\-?\.?\s?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}'
+
+    COMBINED_PATTERN = fr"{TIER3_PATTERN}|{URL_PATTERN}|{PHONE_PATTERN}"
+
+    matches1 = re.findall(TIER1_PATTERN, original_content, flags=re.IGNORECASE)
+    if(len(matches1) > 0):
+        return "[content removed due to severe violation]", 5
+    
+    matches2 = re.findall(TIER2_PATTERN, original_content, flags=re.IGNORECASE)
+    if(len(matches2) > 0):
+        return "[content removed due to spam/scam policy]", 5    
+
+    matches3 = re.findall(TIER3_PATTERN, original_content, flags=re.IGNORECASE)
+    score += len(matches3) * 2
+
+    matchesURL = re.findall(URL_PATTERN, original_content, flags=re.IGNORECASE)
+    score += len(matchesURL) * 2
+
+    matchesP = re.findall(PHONE_PATTERN, original_content, flags=re.IGNORECASE)
+    score += len(matchesP) * 2
+
+    chars = len(original_content)
+    if chars > 0:
+        uppercase = len(re.findall(r'[A-Z]', original_content))
+        if chars > 15 and uppercase / chars > 0.7:
+            score += 0.5
+    
+    moderated_content = re.sub(
+        COMBINED_PATTERN,
+        lambda m: (
+            "[link removed]" if re.match(URL_PATTERN, m.group(0), re.IGNORECASE)
+            else "[Phone number removed]" if re.match(PHONE_PATTERN, m.group(0), re.IGNORECASE)
+            else '*' * len(m.group(0))
+        ),
+        original_content,
+        flags=re.IGNORECASE
+    )
+
     return moderated_content, score
 
 
 if __name__ == '__main__':
     app.run(debug=True, port=8080)
-

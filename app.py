@@ -892,6 +892,16 @@ def recommend(user_id, filter_following):
 
     recommended_posts = {} 
 
+    liked_posts_content = query_db('''
+        SELECT p.content FROM posts p
+        JOIN reactions r ON p.id = r.post_id
+        WHERE r.user_id = ?
+    ''', (user_id,))
+
+    word_counts = collections.Counter()
+    stop_words = {'a', 'an', 'the', 'in', 'on', 'is', 'it', 'to', 'for', 'of', 'and', 'with'}
+    
+
     return recommended_posts;
 
 # Task 3.2
@@ -908,7 +918,7 @@ def user_risk_analysis(user_id):
             password: admin
         Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
-    
+    spammerScore = 0
     postScore = 0
     commentScore = 0
     user_risk_score = 0
@@ -917,14 +927,16 @@ def user_risk_analysis(user_id):
     # Fetch result from database
     result = query_db('SELECT created_at FROM users WHERE id = ?', (user_id,))
 
+    # Check for null and get accoun age in days
     if result and result[0][0]:
         account_created = result[0][0]
-        now = datetime.now()
+        now = datetime.now() # no account was new enough so i changed this to a earlier date to verify, but now is now
         delta = now - account_created
         account_age = delta.days
     else:
         print("User not found or created_at is null")
 
+    # Post score calculation
     user_posts = query_db('SELECT content FROM posts WHERE user_id = ?', (user_id,))
     for post in user_posts:
         _, post_risk_score = moderate_content(post['content'])
@@ -932,12 +944,23 @@ def user_risk_analysis(user_id):
             postScore += post_risk_score * 1.5
         else:
             postScore += post_risk_score
-            
+
+    # Average post score    
     if(len(user_posts) == 0):
         average_post_score = 0
     else:
         average_post_score = postScore / len(user_posts)
 
+    # Spam score calculation (additional feature)
+    spammers = query_db('SELECT content, COUNT(*) as count FROM posts WHERE user_id = ? GROUP BY user_id, content HAVING COUNT(*) > 2', (user_id,))
+    if(len(spammers) > 0):
+        spam_count = sum([int(row['count']) - 1 for row in spammers]) # sum of spam posts
+
+        # normalizing it so that it can have max value of 2.0 when 10 or more spam posts
+        spam_index = 5
+        spammerScore = min(spam_count / spam_index, 2.0)
+
+    # Comment score calculation
     user_comments = query_db('SELECT content FROM comments WHERE user_id = ?', (user_id,))
     for comment in user_comments:
         _, comment_risk_score = moderate_content(comment['content'])
@@ -946,19 +969,23 @@ def user_risk_analysis(user_id):
         else:
             commentScore += comment_risk_score
 
+    # Average comment score  
     if(len(user_comments) == 0):
         average_comment_score = 0
     else:
         average_comment_score = commentScore / len(user_comments)
 
+    # Profile score calculation
     profiletext = query_db('SELECT profile FROM users WHERE id = ?', (user_id,))
     if profiletext and profiletext[0][0]:
         _, profile_score = moderate_content(profiletext[0][0])
     else:
         profile_score = 0
 
-    content_risk_score = (profile_score * 1) + (average_post_score * 3) + (average_comment_score * 1)
+    # Combined score for user
+    content_risk_score = (profile_score * 1) + (average_post_score * 3) + (average_comment_score * 1) + (spammerScore * 1)
 
+    # Taking the account age in to consideration
     if(account_age < 7):
         user_risk_score = content_risk_score * 1.5
     elif(account_age < 30):
@@ -999,31 +1026,39 @@ def moderate_content(content):
     # found here https://stackoverflow.com/questions/16699007/regular-expression-to-match-standard-10-digit-phone-number
     PHONE_PATTERN = r'(\+\d{1,2}\s?)?1?\-?\.?\s?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}'
 
+    # For censoring the words
     COMBINED_PATTERN = fr"{TIER3_PATTERN}|{URL_PATTERN}|{PHONE_PATTERN}"
 
+    # Check for matches in TIER1
     matches1 = re.findall(TIER1_PATTERN, original_content, flags=re.IGNORECASE)
     if(len(matches1) > 0):
         return "[content removed due to severe violation]", 5
     
+    # Check for matches in TIER2
     matches2 = re.findall(TIER2_PATTERN, original_content, flags=re.IGNORECASE)
     if(len(matches2) > 0):
         return "[content removed due to spam/scam policy]", 5    
 
+    # Check for matches in TIER3
     matches3 = re.findall(TIER3_PATTERN, original_content, flags=re.IGNORECASE)
     score += len(matches3) * 2
 
+    # Check for matches in URL
     matchesURL = re.findall(URL_PATTERN, original_content, flags=re.IGNORECASE)
     score += len(matchesURL) * 2
 
+    # Check for matches in Phone Number (additional feature)
     matchesP = re.findall(PHONE_PATTERN, original_content, flags=re.IGNORECASE)
     score += len(matchesP) * 2
 
+    # Check for "yelling" (uppercase check)
     chars = len(original_content)
     if chars > 0:
         uppercase = len(re.findall(r'[A-Z]', original_content))
         if chars > 15 and uppercase / chars > 0.7:
             score += 0.5
     
+    # Replacing unwanted content
     moderated_content = re.sub(
         COMBINED_PATTERN,
         lambda m: (

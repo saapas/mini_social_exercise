@@ -6,6 +6,9 @@ import json
 import sqlite3
 import hashlib
 import re
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 from datetime import datetime
 
 app = Flask(__name__)
@@ -890,19 +893,75 @@ def recommend(user_id, filter_following):
     - https://www.researchgate.net/publication/227268858_Recommender_Systems_Handbook
     """
 
-    recommended_posts = {} 
+    ## Got the original from exercise solutions but made it use the tf-idf feature and cosine_similarities to get better recommendations.
 
+    # idea 6.4 part of https://medium.com/@anilcogalan/practical-guide-to-building-scalable-recommender-systems-in-python-b175547e6fce
+
+    # Get the content of all posts the user has rected to positively
     liked_posts_content = query_db('''
         SELECT p.content FROM posts p
         JOIN reactions r ON p.id = r.post_id
         WHERE r.user_id = ?
+        AND r.reaction_type IN ('like', 'love', 'laugh', 'wow')
     ''', (user_id,))
 
-    word_counts = collections.Counter()
-    stop_words = {'a', 'an', 'the', 'in', 'on', 'is', 'it', 'to', 'for', 'of', 'and', 'with'}
-    
+    # If the user hasn't liked any posts return the 5 newest posts
+    if not liked_posts_content:
+        return query_db('''
+            SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+            FROM posts p JOIN users u ON p.user_id = u.id
+            WHERE p.user_id != ? ORDER BY p.created_at DESC LIMIT 5
+        ''', (user_id,))
 
-    return recommended_posts;
+    # getting all wanted posts
+    query = "SELECT p.id, p.content, p.created_at, u.username, u.id as user_id FROM posts p JOIN users u ON p.user_id = u.id"
+    params = []
+
+    # If filtering by following, add a WHERE clause to only include followed users.
+    if filter_following:
+        query += " WHERE p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)"
+        params.append(user_id)
+
+    all_other_posts = query_db(query, tuple(params))
+
+    # Source for tf-idf https://www.geeksforgeeks.org/machine-learning/understanding-tf-idf-term-frequency-inverse-document-frequency/
+    # Extract the content part
+    liked_posts_content = [item[0] for item in liked_posts_content]
+    all_posts_content = [post[1] for post in all_other_posts]
+
+    # Initializing the vectorizer with stopwords from sklearn
+    vectorizer = TfidfVectorizer(stop_words='english')
+
+    # Fit and transform data from all posts for tf-idf, only transform liked posts
+    all_posts_tfidf = vectorizer.fit_transform(all_posts_content)
+    liked_posts_tfidf = vectorizer.transform(liked_posts_content)
+
+    # source https://scikit-learn.org/stable/modules/generated/sklearn.metrics.pairwise.cosine_similarity.html
+    # calculating the mean of liked posts for a userprofile and reshaping to not cause error
+    user_profile = liked_posts_tfidf.mean(axis=0)
+    user_profile_array = np.asarray(user_profile).reshape(1, -1)
+
+    # using the cosine_similarity to calculate similarities across all posts
+    similarities = cosine_similarity(user_profile_array, all_posts_tfidf).flatten()
+
+    # mapping to make the similarity score / postid pairs
+    post_similarities = {}
+    for i, post in enumerate(all_other_posts):
+        post_similarities[post['id']] = similarities[i]
+
+    recommended_posts = []
+    liked_post_ids = {post['id'] for post in query_db('SELECT post_id as id FROM reactions WHERE user_id = ?', (user_id,))}
+    
+    for post in all_other_posts:
+        if post['id'] in liked_post_ids or post['user_id'] == user_id:
+            continue
+        
+        if post_similarities[post['id']] > 0.1: #Threshold to not include everything
+            recommended_posts.append(post)
+
+    recommended_posts.sort(key=lambda p: post_similarities[p['id']], reverse=True)
+
+    return recommended_posts[:5]
 
 # Task 3.2
 def user_risk_analysis(user_id):
@@ -952,7 +1011,7 @@ def user_risk_analysis(user_id):
         average_post_score = postScore / len(user_posts)
 
     # Spam score calculation (additional feature)
-    spammers = query_db('SELECT content, COUNT(*) as count FROM posts WHERE user_id = ? GROUP BY user_id, content HAVING COUNT(*) > 2', (user_id,))
+    spammers = query_db('SELECT content, COUNT(*) as count FROM posts WHERE user_id = ? GROUP BY user_id, content HAVING COUNT(*) > 1', (user_id,))
     if(len(spammers) > 0):
         spam_count = sum([int(row['count']) - 1 for row in spammers]) # sum of spam posts
 
@@ -993,6 +1052,10 @@ def user_risk_analysis(user_id):
     else:
         user_risk_score = content_risk_score
     
+    # Printing all userids whose score is more than 5 and their scores for the top5
+    if(user_risk_score > 5):
+        print(user_risk_score, user_id)
+    
     return user_risk_score;
     
 # Task 3.3
@@ -1020,8 +1083,8 @@ def moderate_content(content):
     TIER2_PATTERN = r'\b(' + '|'.join(TIER2_PHRASES) + r')\b'
     TIER3_PATTERN = r'\b(' + '|'.join(TIER3_WORDS) + r')\b'
 
-    # found here https://www.freecodecamp.org/news/how-to-write-a-regular-expression-for-a-url/, but extended it by adding also possibility for [.] and \b
-    URL_PATTERN = r'\b((?:https:\/\/www\.|http:\/\/www\.|https:\/\/|http:\/\/)?[a-zA-Z0-9]{2,}((?:\.|\[\.\])[a-zA-Z0-9]{2,})((?:\.|\[\.\])[a-zA-Z0-9]{2,})?)\b'
+    # found here https://www.freecodecamp.org/news/how-to-write-a-regular-expression-for-a-url/, but extended it by adding also possibility for [.]
+    URL_PATTERN = r'(?:https:\/\/www\.|http:\/\/www\.|https:\/\/|http:\/\/)?[a-zA-Z0-9]{2,}((?:\.|\[\.\])[a-zA-Z0-9]{2,})((?:\.|\[\.\])[a-zA-Z0-9]{2,})?'
 
     # found here https://stackoverflow.com/questions/16699007/regular-expression-to-match-standard-10-digit-phone-number
     PHONE_PATTERN = r'(\+\d{1,2}\s?)?1?\-?\.?\s?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}'
@@ -1054,8 +1117,9 @@ def moderate_content(content):
     # Check for "yelling" (uppercase check)
     chars = len(original_content)
     if chars > 0:
+        all = len(re.findall(r'[A-Za-z]', original_content))
         uppercase = len(re.findall(r'[A-Z]', original_content))
-        if chars > 15 and uppercase / chars > 0.7:
+        if all > 15 and uppercase / all > 0.7:
             score += 0.5
     
     # Replacing unwanted content
@@ -1069,7 +1133,9 @@ def moderate_content(content):
         original_content,
         flags=re.IGNORECASE
     )
-
+    if(score > 5):
+        score = 5
+    
     return moderated_content, score
 
 
